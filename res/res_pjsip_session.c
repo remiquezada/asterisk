@@ -52,6 +52,7 @@
 #include "asterisk/test.h"
 #include "asterisk/stream.h"
 #include "asterisk/vector.h"
+#include "asterisk/rtp_engine.h"
 
 #include "res_pjsip_session/pjsip_session.h"
 
@@ -61,6 +62,11 @@
 
 /* Most common case is one audio and one video stream */
 #define DEFAULT_NUM_SESSION_MEDIA 2
+
+struct ast_sip_session_media_rtp_payloads {
+	struct ast_rtp_payload_type *payloads[AST_RTP_MAX_PT];
+	char *fmtp[AST_RTP_MAX_PT];
+};
 
 /* Some forward declarations */
 static void handle_session_begin(struct ast_sip_session *session);
@@ -475,6 +481,122 @@ static int stream_destroy(void *obj, void *arg, int flags)
 	return 0;
 }
 
+static void direct_media_payloads_destroy(struct ast_sip_session_media_rtp_payloads *payloads)
+{
+	int payload;
+
+	if (!payloads) {
+		return;
+	}
+
+	for (payload = 0; payload < AST_RTP_MAX_PT; ++payload) {
+		ao2_cleanup(payloads->payloads[payload]);
+		ast_free(payloads->fmtp[payload]);
+	}
+	ast_free(payloads);
+}
+
+static int direct_media_payloads_equal(const struct ast_sip_session_media_rtp_payloads *left,
+	const struct ast_sip_session_media_rtp_payloads *right)
+{
+	int payload;
+
+	if (!left || !right) {
+		return left == right;
+	}
+
+	for (payload = 0; payload < AST_RTP_MAX_PT; ++payload) {
+		const struct ast_rtp_payload_type *left_type = left->payloads[payload];
+		const struct ast_rtp_payload_type *right_type = right->payloads[payload];
+
+		if (!left_type || !right_type) {
+			if (left_type != right_type) {
+				return 0;
+			}
+			continue;
+		}
+
+		if (left_type->asterisk_format != right_type->asterisk_format
+			|| left_type->rtp_code != right_type->rtp_code
+			|| left_type->sample_rate != right_type->sample_rate
+			|| (left_type->asterisk_format
+				&& ast_format_cmp(left_type->format, right_type->format) == AST_FORMAT_CMP_NOT_EQUAL)
+			|| strcmp(S_OR(left->fmtp[payload], ""), S_OR(right->fmtp[payload], ""))) {
+			return 0;
+		}
+	}
+
+	return 1;
+}
+
+int ast_sip_session_media_set_direct_media_payloads(
+	struct ast_sip_session_media *session_media, struct ast_rtp_instance *rtp)
+{
+	struct ast_sip_session_media_rtp_payloads *payloads = NULL;
+	int payload;
+	int changed = 0;
+
+	if (rtp) {
+		payloads = ast_calloc(1, sizeof(*payloads));
+		if (!payloads) {
+			return -1;
+		}
+
+		for (payload = 0; payload < AST_RTP_MAX_PT; ++payload) {
+			payloads->payloads[payload] = ast_rtp_codecs_get_payload_tx(
+				ast_rtp_instance_get_codecs(rtp), payload);
+			if (payloads->payloads[payload] && payloads->payloads[payload]->fmtp) {
+				payloads->fmtp[payload] = ast_strdup(payloads->payloads[payload]->fmtp);
+				if (!payloads->fmtp[payload]) {
+					direct_media_payloads_destroy(payloads);
+					return -1;
+				}
+			} else if (payloads->payloads[payload] && payloads->payloads[payload]->asterisk_format
+				&& payloads->payloads[payload]->format) {
+				struct ast_str *fmtp = ast_str_create(64);
+				int has_fmtp;
+
+				if (!fmtp) {
+					direct_media_payloads_destroy(payloads);
+					return -1;
+				}
+				ast_format_generate_sdp_fmtp(payloads->payloads[payload]->format,
+					payload, &fmtp);
+				has_fmtp = ast_str_strlen(fmtp) != 0;
+				if (has_fmtp) {
+					payloads->fmtp[payload] = ast_strdup(ast_str_buffer(fmtp));
+				}
+				ast_free(fmtp);
+				if (has_fmtp && !payloads->fmtp[payload]) {
+					direct_media_payloads_destroy(payloads);
+					return -1;
+				}
+			}
+		}
+	}
+
+	changed = !direct_media_payloads_equal(session_media->direct_media_payloads, payloads);
+
+	if (!changed) {
+		direct_media_payloads_destroy(payloads);
+		return 0;
+	}
+
+	direct_media_payloads_destroy(session_media->direct_media_payloads);
+	session_media->direct_media_payloads = payloads;
+	return 1;
+}
+
+struct ast_rtp_payload_type *ast_sip_session_media_get_direct_media_payload(
+	const struct ast_sip_session_media *session_media, int payload)
+{
+	if (!session_media->direct_media_payloads || payload < 0 || payload >= AST_RTP_MAX_PT) {
+		return NULL;
+	}
+
+	return ao2_bump(session_media->direct_media_payloads->payloads[payload]);
+}
+
 static void session_media_dtor(void *obj)
 {
 	struct ast_sip_session_media *session_media = obj;
@@ -489,6 +611,8 @@ static void session_media_dtor(void *obj)
 	if (session_media->srtp) {
 		ast_sdp_srtp_destroy(session_media->srtp);
 	}
+
+	direct_media_payloads_destroy(session_media->direct_media_payloads);
 
 	ast_free(session_media->mid);
 	ast_free(session_media->remote_mslabel);
