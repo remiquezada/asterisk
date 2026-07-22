@@ -27,6 +27,7 @@
 /*** MODULEINFO
 	<depend>TEST_FRAMEWORK</depend>
 	<depend>res_format_attr_opus</depend>
+	<depend>res_pjsip_session</depend>
 	<support_level>core</support_level>
  ***/
 
@@ -39,6 +40,7 @@
 #include "asterisk/format_cache.h"
 #include "asterisk/format.h"
 #include "asterisk/opus.h"
+#include "asterisk/res_pjsip_session.h"
 #include <assert.h>
 #include <sched.h>
 
@@ -49,14 +51,26 @@ enum test_type {
 	TEST_TYPE_STD_RTCP, /* Let the stack do RTCP */
 };
 
+static void ast_sched_context_destroy_wrapper(struct ast_sched_context *sched);
+static int test_init_rtp_instances(struct ast_rtp_instance **instance1,
+	struct ast_rtp_instance **instance2, struct ast_sched_context *test_sched,
+	enum test_type type);
+
 AST_TEST_DEFINE(payload_mapping_exchange)
 {
 	struct ast_rtp_codecs local = AST_RTP_CODECS_NULL_INIT;
 	struct ast_rtp_codecs peer = AST_RTP_CODECS_NULL_INIT;
 	struct ast_rtp_payload_type *type = NULL;
 	struct ast_rtp_payload_type *local_type = NULL;
+	struct ast_rtp_payload_type *unexpected_type = NULL;
 	struct ast_format *opus = NULL;
+	struct ast_format *peer_opus = NULL;
 	struct ast_str *fmtp = NULL;
+	struct ast_rtp_instance *instance1 = NULL;
+	struct ast_rtp_instance *instance2 = NULL;
+	struct ast_sched_context *test_sched = NULL;
+	struct ast_sip_session_media media1 = { 0, };
+	struct ast_sip_session_media media2 = { 0, };
 	enum ast_test_result_state result = AST_TEST_PASS;
 	int local_initialized = 0;
 	int peer_initialized = 0;
@@ -66,7 +80,7 @@ AST_TEST_DEFINE(payload_mapping_exchange)
 		info->name = "payload_mapping_exchange";
 		info->category = "/res/res_rtp/";
 		info->summary = "Direct media payload mapping exchange";
-		info->description = "Tests transmit mapping access and receive installation with attributes";
+		info->description = "Tests common direct media mappings and their attributes";
 		return AST_TEST_NOT_RUN;
 	case TEST_EXECUTE:
 		break;
@@ -137,11 +151,114 @@ AST_TEST_DEFINE(payload_mapping_exchange)
 		&& strstr(ast_str_buffer(fmtp), "maxaveragebitrate=32000"),
 		"Receive mapping did not preserve Opus fmtp attributes");
 
+	test_sched = ast_sched_context_create();
+	TEST_CHECK(test_sched != NULL, "Unable to create scheduler context");
+	TEST_CHECK(!test_init_rtp_instances(&instance1, &instance2, test_sched, TEST_TYPE_NONE),
+		"Unable to create RTP instances");
+	ast_rtp_instance_set_channel_id(instance1, "A");
+	ast_rtp_instance_set_channel_id(instance2, "B");
+	ast_rtp_codecs_payloads_clear(ast_rtp_instance_get_codecs(instance1), instance1);
+	ast_rtp_codecs_payloads_clear(ast_rtp_instance_get_codecs(instance2), instance2);
+
+	ao2_cleanup(opus);
+	opus = ast_format_parse_sdp_fmtp(ast_format_opus,
+		"maxplaybackrate=16000;maxaveragebitrate=64000;stereo=0;useinbandfec=0");
+	peer_opus = ast_format_parse_sdp_fmtp(ast_format_opus,
+		"maxplaybackrate=48000;maxaveragebitrate=32000;stereo=1;useinbandfec=1");
+	TEST_CHECK(opus && peer_opus, "Unable to create direct media Opus formats");
+	TEST_CHECK(!ast_rtp_codecs_payloads_set_rtpmap_type_rate(
+		ast_rtp_instance_get_codecs(instance1), instance1, 99,
+		"audio", "opus", 0, 48000), "Unable to set first Opus mapping");
+	TEST_CHECK(!ast_rtp_codecs_payload_replace_format(
+		ast_rtp_instance_get_codecs(instance1), 99, opus),
+		"Unable to set first Opus attributes");
+	TEST_CHECK(!ast_rtp_codecs_payloads_set_rtpmap_type_rate(
+		ast_rtp_instance_get_codecs(instance2), instance2, 107,
+		"audio", "opus", 0, 48000), "Unable to set second Opus mapping");
+	TEST_CHECK(!ast_rtp_codecs_payload_replace_format(
+		ast_rtp_instance_get_codecs(instance2), 107, peer_opus),
+		"Unable to set second Opus attributes");
+
+	TEST_CHECK(!ast_rtp_codecs_payloads_set_rtpmap_type_rate(
+		ast_rtp_instance_get_codecs(instance1), instance1, 101,
+		"audio", "telephone-event", 0, 8000), "Unable to set first 8 kHz DTMF mapping");
+	TEST_CHECK(!ast_rtp_codecs_payload_set_fmtp(
+		ast_rtp_instance_get_codecs(instance1), 101, "0-15"),
+		"Unable to set first 8 kHz DTMF events");
+	TEST_CHECK(!ast_rtp_codecs_payloads_set_rtpmap_type_rate(
+		ast_rtp_instance_get_codecs(instance1), instance1, 108,
+		"audio", "telephone-event", 0, 48000), "Unable to set first 48 kHz DTMF mapping");
+	TEST_CHECK(!ast_rtp_codecs_payload_set_fmtp(
+		ast_rtp_instance_get_codecs(instance1), 108, "0-15"),
+		"Unable to set first 48 kHz DTMF events");
+	TEST_CHECK(!ast_rtp_codecs_payloads_set_rtpmap_type_rate(
+		ast_rtp_instance_get_codecs(instance2), instance2, 103,
+		"audio", "telephone-event", 0, 8000), "Unable to set second 8 kHz DTMF mapping");
+	TEST_CHECK(!ast_rtp_codecs_payload_set_fmtp(
+		ast_rtp_instance_get_codecs(instance2), 103, "0-16"),
+		"Unable to set second 8 kHz DTMF events");
+	TEST_CHECK(!ast_rtp_codecs_payloads_set_rtpmap_type_rate(
+		ast_rtp_instance_get_codecs(instance2), instance2, 101,
+		"audio", "telephone-event", 0, 48000), "Unable to set second 48 kHz DTMF mapping");
+	TEST_CHECK(!ast_rtp_codecs_payload_set_fmtp(
+		ast_rtp_instance_get_codecs(instance2), 101, "0-16"),
+		"Unable to set second 48 kHz DTMF events");
+
+	media1.rtp = instance1;
+	media2.rtp = instance2;
+	TEST_CHECK(ast_sip_session_media_set_direct_media_payloads(&media1, instance2) == 1,
+		"Unable to create first common payload snapshot");
+	TEST_CHECK(ast_sip_session_media_set_direct_media_payloads(&media2, instance1) == 1,
+		"Unable to create second common payload snapshot");
+
+	ao2_cleanup(type);
+	type = ast_sip_session_media_get_direct_media_payload(&media1, 99);
+	ao2_cleanup(local_type);
+	local_type = ast_sip_session_media_get_direct_media_payload(&media2, 99);
+	TEST_CHECK(type && local_type && type->asterisk_format && local_type->asterisk_format
+		&& ast_format_cmp(type->format, local_type->format) != AST_FORMAT_CMP_NOT_EQUAL,
+		"The two legs did not select the same Opus payload and attributes");
+	ast_str_reset(fmtp);
+	ast_format_generate_sdp_fmtp(type->format, 99, &fmtp);
+	TEST_CHECK(strstr(ast_str_buffer(fmtp), "maxplaybackrate=16000")
+		&& strstr(ast_str_buffer(fmtp), "maxaveragebitrate=32000"),
+		"The common Opus attributes were not negotiated");
+	unexpected_type = ast_sip_session_media_get_direct_media_payload(&media1, 107);
+	TEST_CHECK(!unexpected_type, "The first leg retained the non-canonical Opus payload");
+	unexpected_type = ast_sip_session_media_get_direct_media_payload(&media2, 107);
+	TEST_CHECK(!unexpected_type, "The second leg retained the non-canonical Opus payload");
+
+	ao2_cleanup(type);
+	type = ast_sip_session_media_get_direct_media_payload(&media1, 101);
+	ao2_cleanup(local_type);
+	local_type = ast_sip_session_media_get_direct_media_payload(&media2, 101);
+	TEST_CHECK(type && local_type && type->sample_rate == 8000 && local_type->sample_rate == 8000
+		&& !strcmp(type->fmtp, "0-15") && !strcmp(local_type->fmtp, "0-15"),
+		"The two legs did not select the same 8 kHz DTMF payload and event range");
+	ao2_cleanup(type);
+	type = ast_sip_session_media_get_direct_media_payload(&media1, 108);
+	ao2_cleanup(local_type);
+	local_type = ast_sip_session_media_get_direct_media_payload(&media2, 108);
+	TEST_CHECK(type && local_type && type->sample_rate == 48000 && local_type->sample_rate == 48000
+		&& !strcmp(type->fmtp, "0-15") && !strcmp(local_type->fmtp, "0-15"),
+		"The two legs did not select the same 48 kHz DTMF payload and event range");
+
 cleanup:
+	ast_sip_session_media_set_direct_media_payloads(&media1, NULL);
+	ast_sip_session_media_set_direct_media_payloads(&media2, NULL);
+	if (instance1) {
+		ast_rtp_instance_destroy(instance1);
+	}
+	if (instance2) {
+		ast_rtp_instance_destroy(instance2);
+	}
+	ast_sched_context_destroy_wrapper(test_sched);
 	ast_free(fmtp);
 	ao2_cleanup(local_type);
 	ao2_cleanup(type);
+	ao2_cleanup(unexpected_type);
 	ao2_cleanup(opus);
+	ao2_cleanup(peer_opus);
 	if (peer_initialized) {
 		ast_rtp_codecs_payloads_destroy(&peer);
 	}

@@ -79,7 +79,7 @@ typedef int (*ast_sip_session_media_write_cb)(struct ast_sip_session *session, s
 struct ast_sip_session_media {
 	/*! \brief RTP instance itself */
 	struct ast_rtp_instance *rtp;
-	/*! \brief Snapshot of the direct media peer's transmit payload mappings */
+	/*! \brief Snapshot of the common direct media transmit payload mappings */
 	struct ast_sip_session_media_rtp_payloads *direct_media_payloads;
 	/*! \brief UDPTL instance itself */
 	struct ast_udptl *udptl;
@@ -134,7 +134,7 @@ struct ast_sip_session_media {
 };
 
 /*!
- * \brief Replace the direct media payload snapshot from an RTP instance
+ * \brief Replace the direct media payload snapshot with mappings common to two RTP instances
  *
  * \param session_media Session media to update
  * \param rtp Direct media peer, or NULL to clear the snapshot

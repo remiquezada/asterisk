@@ -529,49 +529,260 @@ static int direct_media_payloads_equal(const struct ast_sip_session_media_rtp_pa
 	return 1;
 }
 
+#define DTMF_EVENT_COUNT 256
+
+static int direct_media_dtmf_fmtp_parse(const char *fmtp, unsigned char events[DTMF_EVENT_COUNT])
+{
+	const char *cursor = S_OR(fmtp, "0-16");
+
+	memset(events, 0, DTMF_EVENT_COUNT);
+	while (*cursor) {
+		char *end;
+		long first;
+		long last;
+		long event;
+
+		while (isspace((unsigned char) *cursor)) {
+			++cursor;
+		}
+		first = strtol(cursor, &end, 10);
+		if (end == cursor || first < 0 || first >= DTMF_EVENT_COUNT) {
+			return -1;
+		}
+		cursor = end;
+		while (isspace((unsigned char) *cursor)) {
+			++cursor;
+		}
+
+		last = first;
+		if (*cursor == '-') {
+			cursor++;
+			while (isspace((unsigned char) *cursor)) {
+				++cursor;
+			}
+			last = strtol(cursor, &end, 10);
+			if (end == cursor || last < first || last >= DTMF_EVENT_COUNT) {
+				return -1;
+			}
+			cursor = end;
+		}
+
+		for (event = first; event <= last; ++event) {
+			events[event] = 1;
+		}
+		while (isspace((unsigned char) *cursor)) {
+			++cursor;
+		}
+		if (!*cursor) {
+			break;
+		}
+		if (*cursor++ != ',') {
+			return -1;
+		}
+	}
+
+	return 0;
+}
+
+static int direct_media_dtmf_fmtp_joint(const char *left, const char *right, char **result)
+{
+	unsigned char left_events[DTMF_EVENT_COUNT];
+	unsigned char right_events[DTMF_EVENT_COUNT];
+	struct ast_str *joint;
+	int event;
+	int found = 0;
+
+	*result = NULL;
+	if (direct_media_dtmf_fmtp_parse(left, left_events)
+		|| direct_media_dtmf_fmtp_parse(right, right_events)) {
+		if (strcmp(S_OR(left, ""), S_OR(right, ""))) {
+			return 0;
+		}
+		*result = ast_strdup(left);
+		return left && !*result ? -1 : 1;
+	}
+
+	joint = ast_str_create(16);
+	if (!joint) {
+		return -1;
+	}
+	for (event = 0; event < DTMF_EVENT_COUNT; ++event) {
+		int first;
+		int last;
+
+		if (!left_events[event] || !right_events[event]) {
+			continue;
+		}
+		first = event;
+		while (event + 1 < DTMF_EVENT_COUNT
+			&& left_events[event + 1] && right_events[event + 1]) {
+			++event;
+		}
+		last = event;
+		ast_str_append(&joint, 0, "%s%d", found ? "," : "", first);
+		if (last != first) {
+			ast_str_append(&joint, 0, "-%d", last);
+		}
+		found = 1;
+	}
+
+	if (found) {
+		*result = ast_strdup(ast_str_buffer(joint));
+	}
+	ast_free(joint);
+	return !found ? 0 : (*result ? 1 : -1);
+}
+
+static int direct_media_payload_joint(const struct ast_rtp_payload_type *preferred,
+	const struct ast_rtp_payload_type *other, struct ast_rtp_payload_type **result)
+{
+	struct ast_rtp_payload_type *joint_type;
+	struct ast_format *joint_format = NULL;
+	char *joint_fmtp = NULL;
+	int compatible = 1;
+
+	*result = NULL;
+	if (preferred->asterisk_format != other->asterisk_format) {
+		return 0;
+	}
+
+	if (preferred->asterisk_format) {
+		if (!preferred->format || !other->format
+			|| !(joint_format = ast_format_joint(preferred->format, other->format))) {
+			return 0;
+		}
+	} else if (preferred->rtp_code != other->rtp_code
+		|| (preferred->sample_rate ? preferred->sample_rate
+			: ast_rtp_lookup_sample_rate2(0, NULL, preferred->rtp_code))
+			!= (other->sample_rate ? other->sample_rate
+				: ast_rtp_lookup_sample_rate2(0, NULL, other->rtp_code))) {
+		return 0;
+	} else if (preferred->rtp_code == AST_RTP_DTMF) {
+		compatible = direct_media_dtmf_fmtp_joint(preferred->fmtp, other->fmtp, &joint_fmtp);
+		if (compatible <= 0) {
+			return compatible;
+		}
+	} else if (strcmp(S_OR(preferred->fmtp, ""), S_OR(other->fmtp, ""))) {
+		return 0;
+	} else if (preferred->fmtp && !(joint_fmtp = ast_strdup(preferred->fmtp))) {
+		return -1;
+	}
+
+	joint_type = ast_rtp_engine_alloc_payload_type();
+	if (!joint_type) {
+		ao2_cleanup(joint_format);
+		ast_free(joint_fmtp);
+		return -1;
+	}
+	*joint_type = *preferred;
+	joint_type->format = joint_format;
+	joint_type->fmtp = joint_fmtp;
+	*result = joint_type;
+	return 1;
+}
+
+static struct ast_sip_session_media_rtp_payloads *direct_media_payloads_alloc(
+	struct ast_rtp_instance *local_rtp, struct ast_rtp_instance *peer_rtp)
+{
+	struct ast_sip_session_media_rtp_payloads *payloads;
+	struct ast_rtp_instance *preferred_rtp;
+	struct ast_rtp_instance *other_rtp;
+	const char *local_id;
+	const char *peer_id;
+	int payload;
+
+	payloads = ast_calloc(1, sizeof(*payloads));
+	if (!payloads) {
+		return NULL;
+	}
+
+	local_id = ast_rtp_instance_get_channel_id(local_rtp);
+	peer_id = ast_rtp_instance_get_channel_id(peer_rtp);
+	if (strcmp(local_id, peer_id) < 0
+		|| (!strcmp(local_id, peer_id) && (uintptr_t) local_rtp < (uintptr_t) peer_rtp)) {
+		preferred_rtp = local_rtp;
+		other_rtp = peer_rtp;
+	} else {
+		preferred_rtp = peer_rtp;
+		other_rtp = local_rtp;
+	}
+
+	for (payload = 0; payload < AST_RTP_MAX_PT; ++payload) {
+		struct ast_rtp_payload_type *preferred;
+		int other_payload;
+
+		preferred = ast_rtp_codecs_get_payload_tx(
+			ast_rtp_instance_get_codecs(preferred_rtp), payload);
+		if (!preferred) {
+			continue;
+		}
+
+		for (other_payload = 0; other_payload < AST_RTP_MAX_PT; ++other_payload) {
+			struct ast_rtp_payload_type *other;
+			int compatible;
+
+			other = ast_rtp_codecs_get_payload_tx(
+				ast_rtp_instance_get_codecs(other_rtp), other_payload);
+			if (!other) {
+				continue;
+			}
+			compatible = direct_media_payload_joint(preferred, other,
+				&payloads->payloads[payload]);
+			ao2_ref(other, -1);
+			if (compatible < 0) {
+				ao2_ref(preferred, -1);
+				direct_media_payloads_destroy(payloads);
+				return NULL;
+			}
+			if (compatible) {
+				break;
+			}
+		}
+		ao2_ref(preferred, -1);
+
+		if (payloads->payloads[payload] && payloads->payloads[payload]->fmtp) {
+			payloads->fmtp[payload] = ast_strdup(payloads->payloads[payload]->fmtp);
+			if (!payloads->fmtp[payload]) {
+				direct_media_payloads_destroy(payloads);
+				return NULL;
+			}
+		} else if (payloads->payloads[payload]
+			&& payloads->payloads[payload]->asterisk_format
+			&& payloads->payloads[payload]->format) {
+			struct ast_str *fmtp = ast_str_create(64);
+			int has_fmtp;
+
+			if (!fmtp) {
+				direct_media_payloads_destroy(payloads);
+				return NULL;
+			}
+			ast_format_generate_sdp_fmtp(payloads->payloads[payload]->format,
+				payload, &fmtp);
+			has_fmtp = ast_str_strlen(fmtp) != 0;
+			if (has_fmtp) {
+				payloads->fmtp[payload] = ast_strdup(ast_str_buffer(fmtp));
+			}
+			ast_free(fmtp);
+			if (has_fmtp && !payloads->fmtp[payload]) {
+				direct_media_payloads_destroy(payloads);
+				return NULL;
+			}
+		}
+	}
+
+	return payloads;
+}
+
 int ast_sip_session_media_set_direct_media_payloads(
 	struct ast_sip_session_media *session_media, struct ast_rtp_instance *rtp)
 {
 	struct ast_sip_session_media_rtp_payloads *payloads = NULL;
-	int payload;
 	int changed = 0;
 
 	if (rtp) {
-		payloads = ast_calloc(1, sizeof(*payloads));
-		if (!payloads) {
+		if (!session_media->rtp
+			|| !(payloads = direct_media_payloads_alloc(session_media->rtp, rtp))) {
 			return -1;
-		}
-
-		for (payload = 0; payload < AST_RTP_MAX_PT; ++payload) {
-			payloads->payloads[payload] = ast_rtp_codecs_get_payload_tx(
-				ast_rtp_instance_get_codecs(rtp), payload);
-			if (payloads->payloads[payload] && payloads->payloads[payload]->fmtp) {
-				payloads->fmtp[payload] = ast_strdup(payloads->payloads[payload]->fmtp);
-				if (!payloads->fmtp[payload]) {
-					direct_media_payloads_destroy(payloads);
-					return -1;
-				}
-			} else if (payloads->payloads[payload] && payloads->payloads[payload]->asterisk_format
-				&& payloads->payloads[payload]->format) {
-				struct ast_str *fmtp = ast_str_create(64);
-				int has_fmtp;
-
-				if (!fmtp) {
-					direct_media_payloads_destroy(payloads);
-					return -1;
-				}
-				ast_format_generate_sdp_fmtp(payloads->payloads[payload]->format,
-					payload, &fmtp);
-				has_fmtp = ast_str_strlen(fmtp) != 0;
-				if (has_fmtp) {
-					payloads->fmtp[payload] = ast_strdup(ast_str_buffer(fmtp));
-				}
-				ast_free(fmtp);
-				if (has_fmtp && !payloads->fmtp[payload]) {
-					direct_media_payloads_destroy(payloads);
-					return -1;
-				}
-			}
 		}
 	}
 
