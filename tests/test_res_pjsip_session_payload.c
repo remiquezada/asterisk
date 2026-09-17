@@ -110,27 +110,15 @@ AST_TEST_DEFINE(payload_mapping_exchange)
 	TEST_CHECK(!ast_rtp_codecs_payloads_set_rtpmap_type_rate(
 		ast_rtp_instance_get_codecs(rtp1), rtp1, 101,
 		"audio", "telephone-event", 0, 8000), "Unable to set first 8 kHz DTMF mapping");
-	TEST_CHECK(!ast_rtp_codecs_payload_set_fmtp(
-		ast_rtp_instance_get_codecs(rtp1), 101, "0-15"),
-		"Unable to set first 8 kHz DTMF events");
 	TEST_CHECK(!ast_rtp_codecs_payloads_set_rtpmap_type_rate(
 		ast_rtp_instance_get_codecs(rtp1), rtp1, 108,
 		"audio", "telephone-event", 0, 48000), "Unable to set first 48 kHz DTMF mapping");
-	TEST_CHECK(!ast_rtp_codecs_payload_set_fmtp(
-		ast_rtp_instance_get_codecs(rtp1), 108, "0-15"),
-		"Unable to set first 48 kHz DTMF events");
 	TEST_CHECK(!ast_rtp_codecs_payloads_set_rtpmap_type_rate(
 		ast_rtp_instance_get_codecs(rtp2), rtp2, 103,
 		"audio", "telephone-event", 0, 8000), "Unable to set second 8 kHz DTMF mapping");
-	TEST_CHECK(!ast_rtp_codecs_payload_set_fmtp(
-		ast_rtp_instance_get_codecs(rtp2), 103, "0-16"),
-		"Unable to set second 8 kHz DTMF events");
 	TEST_CHECK(!ast_rtp_codecs_payloads_set_rtpmap_type_rate(
 		ast_rtp_instance_get_codecs(rtp2), rtp2, 101,
 		"audio", "telephone-event", 0, 48000), "Unable to set second 48 kHz DTMF mapping");
-	TEST_CHECK(!ast_rtp_codecs_payload_set_fmtp(
-		ast_rtp_instance_get_codecs(rtp2), 101, "0-16"),
-		"Unable to set second 48 kHz DTMF events");
 
 	media1.rtp = rtp1;
 	media2.rtp = rtp2;
@@ -138,11 +126,13 @@ AST_TEST_DEFINE(payload_mapping_exchange)
 		"Unable to create first common payload snapshot");
 	TEST_CHECK(ast_sip_session_media_set_direct_media_payloads(&media2, rtp1) == 1,
 		"Unable to create second common payload snapshot");
+	TEST_CHECK(ast_sip_session_media_set_direct_media_payloads(&media1, rtp2) == 0,
+		"Unchanged session mappings triggered an update");
 
-	type1 = ast_sip_session_media_get_direct_media_payload(&media1, 99);
-	type2 = ast_sip_session_media_get_direct_media_payload(&media2, 99);
+	type1 = ast_rtp_codecs_get_payload(media1.direct_media_payloads, 99);
+	type2 = ast_rtp_codecs_get_payload(media2.direct_media_payloads, 99);
 	TEST_CHECK(type1 && type2 && type1->asterisk_format && type2->asterisk_format
-		&& ast_format_cmp(type1->format, type2->format) != AST_FORMAT_CMP_NOT_EQUAL,
+		&& ast_format_cmp(type1->format, type2->format) == AST_FORMAT_CMP_EQUAL,
 		"The two legs did not select the same Opus payload and attributes");
 	fmtp = ast_str_create(128);
 	TEST_CHECK(fmtp != NULL, "Unable to allocate Opus fmtp output");
@@ -150,27 +140,28 @@ AST_TEST_DEFINE(payload_mapping_exchange)
 	TEST_CHECK(strstr(ast_str_buffer(fmtp), "maxplaybackrate=16000")
 		&& strstr(ast_str_buffer(fmtp), "maxaveragebitrate=32000"),
 		"The common Opus attributes were not negotiated");
-	unexpected = ast_sip_session_media_get_direct_media_payload(&media1, 107);
+	unexpected = ast_rtp_codecs_get_payload(media1.direct_media_payloads, 107);
 	TEST_CHECK(!unexpected, "The first leg retained the non-canonical Opus payload");
-	unexpected = ast_sip_session_media_get_direct_media_payload(&media2, 107);
+	unexpected = ast_rtp_codecs_get_payload(media2.direct_media_payloads, 107);
 	TEST_CHECK(!unexpected, "The second leg retained the non-canonical Opus payload");
 
 	ao2_cleanup(type1);
-	type1 = ast_sip_session_media_get_direct_media_payload(&media1, 101);
+	type1 = ast_rtp_codecs_get_payload(media1.direct_media_payloads, 101);
 	ao2_cleanup(type2);
-	type2 = ast_sip_session_media_get_direct_media_payload(&media2, 101);
-	TEST_CHECK(type1 && type2 && type1->sample_rate == 8000 && type2->sample_rate == 8000
-		&& type1->fmtp && type2->fmtp
-		&& !strcmp(type1->fmtp, "0-15") && !strcmp(type2->fmtp, "0-15"),
+	type2 = ast_rtp_codecs_get_payload(media2.direct_media_payloads, 101);
+	TEST_CHECK(type1 && type2 && type1->sample_rate == 8000 && type2->sample_rate == 8000,
 		"The two legs did not select the same 8 kHz DTMF mapping");
 	ao2_cleanup(type1);
-	type1 = ast_sip_session_media_get_direct_media_payload(&media1, 108);
+	type1 = ast_rtp_codecs_get_payload(media1.direct_media_payloads, 108);
 	ao2_cleanup(type2);
-	type2 = ast_sip_session_media_get_direct_media_payload(&media2, 108);
-	TEST_CHECK(type1 && type2 && type1->sample_rate == 48000 && type2->sample_rate == 48000
-		&& type1->fmtp && type2->fmtp
-		&& !strcmp(type1->fmtp, "0-15") && !strcmp(type2->fmtp, "0-15"),
+	type2 = ast_rtp_codecs_get_payload(media2.direct_media_payloads, 108);
+	TEST_CHECK(type1 && type2 && type1->sample_rate == 48000 && type2->sample_rate == 48000,
 		"The two legs did not select the same 48 kHz DTMF mapping");
+	TEST_CHECK(ast_sip_session_media_set_direct_media_payloads(&media1, NULL) == 1
+		&& !media1.direct_media_payloads,
+		"Ending direct media did not release the common mappings");
+	TEST_CHECK(ast_sip_session_media_set_direct_media_payloads(&media1, NULL) == 0,
+		"Clearing an empty session mapping triggered an update");
 
 cleanup:
 	ast_sip_session_media_set_direct_media_payloads(&media1, NULL);

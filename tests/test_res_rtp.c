@@ -27,6 +27,7 @@
 /*** MODULEINFO
 	<depend>TEST_FRAMEWORK</depend>
 	<depend>res_format_attr_opus</depend>
+	<depend>res_rtp_asterisk</depend>
 	<support_level>core</support_level>
  ***/
 
@@ -51,22 +52,29 @@ enum test_type {
 
 AST_TEST_DEFINE(payload_mapping_exchange)
 {
-	struct ast_rtp_codecs local = AST_RTP_CODECS_NULL_INIT;
-	struct ast_rtp_codecs peer = AST_RTP_CODECS_NULL_INIT;
+	struct ast_sched_context *sched = NULL;
+	struct ast_rtp_instance *local = NULL;
+	struct ast_rtp_instance *peer = NULL;
+	struct ast_rtp_codecs *common = NULL;
+	struct ast_rtp_codecs *reverse = NULL;
+	struct ast_rtp_codecs *local_codecs;
+	struct ast_rtp_codecs *peer_codecs;
 	struct ast_rtp_payload_type *type = NULL;
-	struct ast_rtp_payload_type *local_type = NULL;
-	struct ast_format *opus = NULL;
+	struct ast_rtp_payload_type *reverse_type = NULL;
+	struct ast_format *opus1 = NULL;
+	struct ast_format *opus2 = NULL;
+	struct ast_format *changed = NULL;
 	struct ast_str *fmtp = NULL;
+	const int *bitrate;
+	struct ast_sockaddr address;
 	enum ast_test_result_state result = AST_TEST_PASS;
-	int local_initialized = 0;
-	int peer_initialized = 0;
 
 	switch (cmd) {
 	case TEST_INIT:
 		info->name = "payload_mapping_exchange";
 		info->category = "/res/res_rtp/";
-		info->summary = "Direct media payload mapping exchange";
-		info->description = "Tests transmit mapping access and receive installation with attributes";
+		info->summary = "Common direct media payload mappings";
+		info->description = "Tests common codec attributes, DTMF clock rates, collisions, and updates";
 		return AST_TEST_NOT_RUN;
 	case TEST_EXECUTE:
 		break;
@@ -81,72 +89,147 @@ AST_TEST_DEFINE(payload_mapping_exchange)
 		} \
 	} while (0)
 
-	TEST_CHECK(!ast_rtp_codecs_payloads_initialize(&local), "Unable to initialize local codecs");
-	local_initialized = 1;
-	TEST_CHECK(!ast_rtp_codecs_payloads_initialize(&peer), "Unable to initialize peer codecs");
-	peer_initialized = 1;
+	sched = ast_sched_context_create();
+	TEST_CHECK(sched, "Unable to create scheduler");
+	ast_sockaddr_parse(&address, "127.0.0.1", 0);
+	local = ast_rtp_instance_new("asterisk", sched, &address, NULL);
+	peer = ast_rtp_instance_new("asterisk", sched, &address, NULL);
+	TEST_CHECK(local && peer, "Unable to create RTP instances");
+	ast_rtp_instance_set_channel_id(local, "A");
+	ast_rtp_instance_set_channel_id(peer, "B");
+	local_codecs = ast_rtp_instance_get_codecs(local);
+	peer_codecs = ast_rtp_instance_get_codecs(peer);
+	ast_rtp_codecs_payloads_clear(local_codecs, local);
+	ast_rtp_codecs_payloads_clear(peer_codecs, peer);
 
-	TEST_CHECK(!ast_rtp_codecs_payloads_set_rtpmap_type_rate(&peer, NULL, 101,
-		"audio", "telephone-event", 0, 8000), "Unable to set peer DTMF mapping");
-	TEST_CHECK(!ast_rtp_codecs_payload_set_fmtp(&peer, 101, "0-15"),
-		"Unable to set peer DTMF format parameters");
-	type = ast_rtp_codecs_get_payload_tx(&peer, 101);
-	TEST_CHECK(type && !type->asterisk_format && type->rtp_code == AST_RTP_DTMF
-		&& type->sample_rate == 8000 && type->fmtp && !strcmp(type->fmtp, "0-15"),
-		"Transmit accessor returned the wrong DTMF mapping or format parameters");
-	TEST_CHECK(!ast_rtp_codecs_payload_set_rx_type(&local, type), "Unable to install DTMF receive mapping");
-	ao2_cleanup(type);
-	type = NULL;
-	TEST_CHECK(!ast_rtp_codecs_payloads_set_rtpmap_type_rate(&peer, NULL, 102,
-		"audio", "telephone-event", 0, 16000), "Unable to set second peer DTMF mapping");
-	type = ast_rtp_codecs_get_payload_tx(&peer, 102);
-	TEST_CHECK(type && type->sample_rate == 16000, "Second DTMF mapping was not retained");
-	TEST_CHECK(!ast_rtp_codecs_payload_set_rx_type(&local, type), "Unable to install second DTMF mapping");
-	ao2_cleanup(type);
-	type = NULL;
-	local_type = ast_rtp_codecs_get_payload(&local, 101);
-	TEST_CHECK(local_type && local_type->sample_rate == 8000
-		&& local_type->fmtp && !strcmp(local_type->fmtp, "0-15"),
-		"First DTMF receive mapping or format parameters were not retained");
-	ao2_cleanup(local_type);
-	local_type = ast_rtp_codecs_get_payload(&local, 102);
-	TEST_CHECK(local_type && local_type->sample_rate == 16000,
-		"Second DTMF receive mapping was not retained");
-	ao2_cleanup(local_type);
-	local_type = NULL;
+	opus1 = ast_format_parse_sdp_fmtp(ast_format_opus,
+		"maxplaybackrate=16000;maxaveragebitrate=64000;stereo=0;useinbandfec=0");
+	opus2 = ast_format_parse_sdp_fmtp(ast_format_opus,
+		"maxplaybackrate=48000;maxaveragebitrate=32000;stereo=1;useinbandfec=1");
+	TEST_CHECK(opus1 && opus2, "Unable to create Opus formats");
+	TEST_CHECK(!ast_rtp_codecs_payload_replace_format(local_codecs, 99, opus1)
+		&& !ast_rtp_codecs_payload_replace_format(peer_codecs, 107, opus2),
+		"Unable to set Opus mappings");
+	ast_rtp_codecs_payloads_set_m_type(local_codecs, NULL, 0);
+	ast_rtp_codecs_payloads_set_m_type(peer_codecs, NULL, 0);
+	TEST_CHECK(!ast_rtp_codecs_payload_replace_format(local_codecs, 97, ast_format_ilbc),
+		"Unable to set unmatched codec");
 
-	ast_rtp_codecs_payloads_clear(&local, NULL);
-	ast_rtp_codecs_payloads_clear(&peer, NULL);
-	TEST_CHECK(!ast_rtp_codecs_payloads_set_rtpmap_type_rate(&peer, NULL, 111,
-		"audio", "opus", 0, 48000), "Unable to set peer Opus mapping");
-	opus = ast_format_parse_sdp_fmtp(ast_format_opus,
-		"stereo=1;useinbandfec=1;maxaveragebitrate=32000");
-	TEST_CHECK(opus != NULL, "Unable to create attributed Opus format");
-	TEST_CHECK(!ast_rtp_codecs_payload_replace_format(&peer, 111, opus),
-		"Unable to attach attributes to peer Opus mapping");
-	type = ast_rtp_codecs_get_payload_tx(&peer, 111);
-	TEST_CHECK(type && type->format == opus, "Transmit accessor did not retain Opus attributes");
-	TEST_CHECK(!ast_rtp_codecs_payload_set_rx_type(&local, type), "Unable to install Opus receive mapping");
-	local_type = ast_rtp_codecs_get_payload(&local, 111);
-	TEST_CHECK(local_type && local_type->format == opus, "Receive mapping did not retain Opus attributes");
+	TEST_CHECK(!ast_rtp_codecs_payloads_set_rtpmap_type_rate(local_codecs, NULL, 101,
+		"audio", "telephone-event", 0, 8000), "Unable to set local 8 kHz DTMF");
+	TEST_CHECK(!ast_rtp_codecs_payloads_set_rtpmap_type_rate(local_codecs, NULL, 108,
+		"audio", "telephone-event", 0, 48000), "Unable to set local 48 kHz DTMF");
+	TEST_CHECK(!ast_rtp_codecs_payloads_set_rtpmap_type_rate(peer_codecs, NULL, 103,
+		"audio", "telephone-event", 0, 8000), "Unable to set peer 8 kHz DTMF");
+	TEST_CHECK(!ast_rtp_codecs_payloads_set_rtpmap_type_rate(peer_codecs, NULL, 101,
+		"audio", "telephone-event", 0, 48000), "Unable to set peer 48 kHz DTMF");
+	TEST_CHECK(!ast_rtp_codecs_payloads_set_rtpmap_type_rate(peer_codecs, NULL, 102,
+		"audio", "telephone-event", 0, 16000), "Unable to set unmatched DTMF rate");
+
+	/* Seed a conflicting receive mapping before installing the common mapping. */
+	ast_rtp_codecs_payloads_xover(peer_codecs, peer_codecs, NULL);
+	TEST_CHECK(ast_rtp_codecs_payloads_set_common(&common, local, peer) == 1,
+		"Unable to build common mappings");
+	TEST_CHECK(ast_rtp_codecs_payloads_set_common(&reverse, peer, local) == 1,
+		"Unable to build reverse common mappings");
+	TEST_CHECK(ast_rtp_codecs_payloads_set_common(&common, local, peer) == 0,
+		"Unchanged mappings triggered an update");
+
+	type = ast_rtp_codecs_get_payload(common, 99);
+	reverse_type = ast_rtp_codecs_get_payload(reverse, 99);
+	TEST_CHECK(type && reverse_type && type->asterisk_format
+		&& ast_format_cmp(type->format, reverse_type->format) == AST_FORMAT_CMP_EQUAL,
+		"Legs did not select the same Opus mapping and attributes");
 	fmtp = ast_str_create(128);
-	TEST_CHECK(fmtp != NULL, "Unable to allocate Opus fmtp output");
-	ast_format_generate_sdp_fmtp(local_type->format, 111, &fmtp);
-	TEST_CHECK(strstr(ast_str_buffer(fmtp), "stereo=1")
-		&& strstr(ast_str_buffer(fmtp), "useinbandfec=1")
-		&& strstr(ast_str_buffer(fmtp), "maxaveragebitrate=32000"),
-		"Receive mapping did not preserve Opus fmtp attributes");
+	TEST_CHECK(fmtp, "Unable to allocate fmtp output");
+	ast_format_generate_sdp_fmtp(type->format, 99, &fmtp);
+	TEST_CHECK(strstr(ast_str_buffer(fmtp), "maxplaybackrate=16000")
+		&& strstr(ast_str_buffer(fmtp), "maxaveragebitrate=32000")
+		&& !strstr(ast_str_buffer(fmtp), "stereo=1")
+		&& !strstr(ast_str_buffer(fmtp), "useinbandfec=1"),
+		"Common Opus attributes were not negotiated");
+	TEST_CHECK(ast_rtp_codecs_find_payload_code(common, 0) == 0
+		&& ast_rtp_codecs_find_payload_code(common, 97) == -1
+		&& ast_rtp_codecs_find_payload_code(common, 107) == -1,
+		"Common mappings included an unmatched codec or noncanonical payload");
+	TEST_CHECK(ast_rtp_codecs_payload_code_tx(common, 1, opus1, 0) == 99
+		&& ast_rtp_codecs_payload_code_tx(common, 1, ast_format_opus, 0) == 99,
+		"Compatible Opus attributes lost the negotiated transmit payload");
+
+	ao2_cleanup(type);
+	type = ast_rtp_codecs_get_payload(common, 101);
+	TEST_CHECK(type && !type->asterisk_format && type->rtp_code == AST_RTP_DTMF
+		&& type->sample_rate == 8000, "Wrong common 8 kHz DTMF mapping");
+	ao2_cleanup(reverse_type);
+	reverse_type = ast_rtp_codecs_get_payload(reverse, 101);
+	TEST_CHECK(reverse_type && reverse_type->sample_rate == 8000,
+		"Reverse mapping retained conflicting DTMF clock rate");
+	ao2_cleanup(type);
+	type = ast_rtp_codecs_get_payload(common, 108);
+	TEST_CHECK(type && type->sample_rate == 48000, "Missing common 48 kHz DTMF mapping");
+	TEST_CHECK(ast_rtp_codecs_payload_code_tx_sample_rate(common, 0, NULL, AST_RTP_DTMF, 16000) == -1,
+		"Unnegotiated DTMF rate fell back to a default payload");
+
+	ast_rtp_codecs_payloads_xover(common, peer_codecs, NULL);
+	ao2_cleanup(type);
+	type = ast_rtp_codecs_get_payload(peer_codecs, 101);
+	TEST_CHECK(type && type->sample_rate == 8000, "Crossover did not replace conflicting RX mapping");
+	TEST_CHECK(ast_rtp_codecs_payloads_set_common(&common, local, peer) == 0,
+		"Installing RX mappings changed the common TX mapping selection");
+
+	changed = ast_format_attribute_set(opus2, "maxaveragebitrate", "16000");
+	TEST_CHECK(changed && !ast_rtp_codecs_payload_replace_format(peer_codecs, 107, changed),
+		"Unable to change peer attributes");
+	TEST_CHECK(ast_rtp_codecs_payloads_set_common(&common, local, peer) == 1,
+		"Attribute-only change did not trigger an update");
+	TEST_CHECK(ast_rtp_codecs_payloads_set_common(&common, local, peer) == 0,
+		"Repeated attributes triggered another update");
+	ao2_cleanup(type);
+	type = ast_rtp_codecs_get_payload(common, 99);
+	TEST_CHECK(type && type->format, "Updated common Opus mapping is missing");
+	bitrate = ast_format_attribute_get(type->format, "maxaveragebitrate");
+	TEST_CHECK(bitrate && *bitrate == 16000,
+		"Updated common mapping retained stale attributes");
+
+	ast_rtp_codecs_payloads_unset(peer_codecs, NULL, 101);
+	ast_rtp_codecs_payloads_unset(peer_codecs, NULL, 102);
+	ast_rtp_codecs_payloads_unset(peer_codecs, NULL, 103);
+	TEST_CHECK(ast_rtp_codecs_payloads_set_common(&common, local, peer) == 1,
+		"Removing peer DTMF did not trigger an update");
+	TEST_CHECK(ast_rtp_codecs_payload_code_tx_sample_rate(common, 0, NULL, AST_RTP_DTMF, 8000) == -1,
+		"Missing peer DTMF was advertised through a fallback mapping");
+
+	ast_rtp_codecs_payloads_clear(peer_codecs, NULL);
+	TEST_CHECK(ast_rtp_codecs_payloads_set_common(&common, local, peer) == 1,
+		"Removing all peer mappings did not trigger an update");
+	TEST_CHECK(ast_rtp_codecs_find_payload_code(common, 0) == -1
+		&& ast_rtp_codecs_find_payload_code(common, 99) == -1,
+		"Empty common mappings retained codecs");
+
+	/* Merged offers may retain more than one mapping of a compatible codec. */
+	TEST_CHECK(!ast_rtp_codecs_payload_replace_format(peer_codecs, 107, opus2),
+		"Unable to restore peer Opus mapping");
+	ast_rtp_codecs_payloads_merge(local_codecs, peer_codecs, NULL);
+	TEST_CHECK(ast_rtp_codecs_payload_code_tx(peer_codecs, 1, opus2, 0) == 107,
+		"Compatible TX mapping took precedence over an exact attribute match");
 
 cleanup:
 	ast_free(fmtp);
-	ao2_cleanup(local_type);
 	ao2_cleanup(type);
-	ao2_cleanup(opus);
-	if (peer_initialized) {
-		ast_rtp_codecs_payloads_destroy(&peer);
+	ao2_cleanup(reverse_type);
+	ao2_cleanup(opus1);
+	ao2_cleanup(opus2);
+	ao2_cleanup(changed);
+	ao2_cleanup(common);
+	ao2_cleanup(reverse);
+	if (local) {
+		ast_rtp_instance_destroy(local);
 	}
-	if (local_initialized) {
-		ast_rtp_codecs_payloads_destroy(&local);
+	if (peer) {
+		ast_rtp_instance_destroy(peer);
+	}
+	if (sched) {
+		ast_sched_context_destroy(sched);
 	}
 #undef TEST_CHECK
 	return result;
@@ -977,4 +1060,9 @@ static int load_module(void)
 	return AST_MODULE_LOAD_SUCCESS;
 }
 
-AST_MODULE_INFO_STANDARD(ASTERISK_GPL_KEY, "RTP/RTCP test module");
+AST_MODULE_INFO(ASTERISK_GPL_KEY, AST_MODFLAG_DEFAULT, "RTP Engine Tests",
+	.support_level = AST_MODULE_SUPPORT_CORE,
+	.load = load_module,
+	.unload = unload_module,
+	.requires = "res_format_attr_opus,res_rtp_asterisk",
+);

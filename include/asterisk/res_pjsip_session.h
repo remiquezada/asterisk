@@ -51,8 +51,7 @@ struct pjmedia_sdp_media;
 struct pjmedia_sdp_session;
 struct ast_dsp;
 struct ast_udptl;
-struct ast_rtp_payload_type;
-struct ast_sip_session_media_rtp_payloads;
+struct ast_rtp_codecs;
 
 /*! \brief T.38 states for a session */
 enum ast_sip_session_t38state {
@@ -79,8 +78,6 @@ typedef int (*ast_sip_session_media_write_cb)(struct ast_sip_session *session, s
 struct ast_sip_session_media {
 	/*! \brief RTP instance itself */
 	struct ast_rtp_instance *rtp;
-	/*! \brief Snapshot of the common direct media transmit payload mappings */
-	struct ast_sip_session_media_rtp_payloads *direct_media_payloads;
 	/*! \brief UDPTL instance itself */
 	struct ast_udptl *udptl;
 	/*! \brief Direct media address */
@@ -131,10 +128,14 @@ struct ast_sip_session_media {
 	char *remote_label;
 	/*! \brief Stream name */
 	char *stream_name;
+	/*! \brief AO2 managed common mappings, set when direct media is requested,
+	 * updated when the peer mappings change, and cleared when direct media ends. */
+	struct ast_rtp_codecs *direct_media_payloads;
 };
 
 /*!
  * \brief Replace the direct media payload snapshot with mappings common to two RTP instances
+ * \since 24.0.0
  *
  * \param session_media Session media to update
  * \param rtp Direct media peer, or NULL to clear the snapshot
@@ -145,14 +146,6 @@ struct ast_sip_session_media {
  */
 int ast_sip_session_media_set_direct_media_payloads(
 	struct ast_sip_session_media *session_media, struct ast_rtp_instance *rtp);
-
-/*!
- * \brief Retrieve a payload from the direct media peer snapshot
- *
- * \note The returned payload has its reference count increased.
- */
-struct ast_rtp_payload_type *ast_sip_session_media_get_direct_media_payload(
-	const struct ast_sip_session_media *session_media, int payload);
 
 /*!
  * \brief Structure which contains read callback information

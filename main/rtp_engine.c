@@ -310,7 +310,6 @@ static void rtp_payload_type_dtor(void *obj)
 	struct ast_rtp_payload_type *payload = obj;
 
 	ao2_cleanup(payload->format);
-	ast_free(payload->fmtp);
 }
 
 static struct ast_rtp_payload_type *rtp_payload_type_alloc(struct ast_format *format,
@@ -336,26 +335,6 @@ static struct ast_rtp_payload_type *rtp_payload_type_alloc(struct ast_format *fo
 struct ast_rtp_payload_type *ast_rtp_engine_alloc_payload_type(void)
 {
 	return rtp_payload_type_alloc(NULL, 0, 0, 0, 0);
-}
-
-static struct ast_rtp_payload_type *rtp_payload_type_clone(
-	const struct ast_rtp_payload_type *source)
-{
-	struct ast_rtp_payload_type *type = ast_rtp_engine_alloc_payload_type();
-
-	if (!type) {
-		return NULL;
-	}
-
-	*type = *source;
-	type->format = ao2_bump(source->format);
-	type->fmtp = ast_strdup(source->fmtp);
-	if (source->fmtp && !type->fmtp) {
-		ao2_ref(type, -1);
-		return NULL;
-	}
-
-	return type;
 }
 
 int ast_rtp_engine_register2(struct ast_rtp_engine *engine, struct ast_module *module)
@@ -1123,12 +1102,14 @@ static void payload_mapping_rx_clear_primary(struct ast_rtp_codecs *codecs, stru
 		}
 
 		/* Replace current with non-primary marked version */
-		new_type = rtp_payload_type_clone(current);
+		new_type = ast_rtp_engine_alloc_payload_type();
 		if (!new_type) {
 			continue;
 		}
+		*new_type = *current;
 		new_type->primary_mapping = 0;
 		new_type->when_retired = now;
+		ao2_bump(new_type->format);
 		AST_VECTOR_REPLACE(&codecs->payload_mapping_rx, idx, new_type);
 		ao2_ref(current, -1);
 	}
@@ -1429,6 +1410,159 @@ void ast_rtp_codecs_payloads_xover(struct ast_rtp_codecs *src, struct ast_rtp_co
 	ast_rwlock_unlock(&dest->codecs_lock);
 }
 
+static void rtp_codecs_common_destroy(void *obj)
+{
+	ast_rtp_codecs_payloads_destroy(obj);
+}
+
+/*! Compare immutable common mappings, including attribute-only changes. */
+static int rtp_codecs_common_equal(struct ast_rtp_codecs *left, struct ast_rtp_codecs *right)
+{
+	int payload;
+
+	if (!left || left->framing != right->framing
+		|| left->preferred_dtmf_pt != right->preferred_dtmf_pt
+		|| left->preferred_dtmf_rate != right->preferred_dtmf_rate
+		|| ((left->preferred_format || right->preferred_format)
+			&& ast_format_cmp(left->preferred_format, right->preferred_format) != AST_FORMAT_CMP_EQUAL)) {
+		return 0;
+	}
+
+	for (payload = 0; payload < AST_RTP_MAX_PT; ++payload) {
+		struct ast_rtp_payload_type *a = AST_VECTOR_GET(&left->payload_mapping_tx, payload);
+		struct ast_rtp_payload_type *b = AST_VECTOR_GET(&right->payload_mapping_tx, payload);
+
+		if (!a || !b) {
+			if (a != b) {
+				return 0;
+			}
+			continue;
+		}
+
+		if (a->asterisk_format != b->asterisk_format
+			|| a->rtp_code != b->rtp_code
+			|| a->sample_rate != b->sample_rate
+			|| (a->asterisk_format
+				&& ast_format_cmp(a->format, b->format) != AST_FORMAT_CMP_EQUAL)) {
+			return 0;
+		}
+	}
+
+	return 1;
+}
+
+int ast_rtp_codecs_payloads_set_common(struct ast_rtp_codecs **codecs,
+	struct ast_rtp_instance *local, struct ast_rtp_instance *peer)
+{
+	struct ast_rtp_codecs *common;
+	struct ast_rtp_codecs *preferred;
+	struct ast_rtp_codecs *other;
+	int order;
+	int payload;
+	int res = -1;
+
+	common = ao2_alloc_options(sizeof(*common), rtp_codecs_common_destroy,
+		AO2_ALLOC_OPT_LOCK_NOLOCK);
+	if (!common) {
+		return -1;
+	}
+	if (ast_rtp_codecs_payloads_initialize(common)) {
+		ao2_ref(common, -1);
+		return -1;
+	}
+
+	/* Both legs must choose the same numbering, regardless of callback order. */
+	order = strcmp(ast_rtp_instance_get_channel_id(local), ast_rtp_instance_get_channel_id(peer));
+	if (order < 0 || (!order && (uintptr_t) local < (uintptr_t) peer)) {
+		preferred = ast_rtp_instance_get_codecs(local);
+		other = ast_rtp_instance_get_codecs(peer);
+	} else {
+		preferred = ast_rtp_instance_get_codecs(peer);
+		other = ast_rtp_instance_get_codecs(local);
+	}
+
+	/* Include empty slots so TX lookups cannot fall back to unnegotiated defaults. */
+	if (AST_VECTOR_REPLACE(&common->payload_mapping_tx, AST_RTP_MAX_PT - 1, NULL)
+		|| AST_VECTOR_REPLACE(&common->payload_mapping_rx, AST_RTP_MAX_PT - 1, NULL)) {
+		ao2_ref(common, -1);
+		return -1;
+	}
+
+	ast_rwlock_rdlock(&preferred->codecs_lock);
+	if (other != preferred) {
+		ast_rwlock_rdlock(&other->codecs_lock);
+	}
+	common->framing = preferred->framing;
+	common->preferred_dtmf_pt = -1;
+	common->preferred_dtmf_rate = -1;
+
+	for (payload = 0; payload < AST_VECTOR_SIZE(&preferred->payload_mapping_tx); ++payload) {
+		struct ast_rtp_payload_type *a = AST_VECTOR_GET(&preferred->payload_mapping_tx, payload);
+		int index;
+
+		if (!a) {
+			continue;
+		}
+
+		for (index = 0; index < AST_VECTOR_SIZE(&other->payload_mapping_tx); ++index) {
+			struct ast_rtp_payload_type *b = AST_VECTOR_GET(&other->payload_mapping_tx, index);
+			struct ast_rtp_payload_type *joint;
+			struct ast_format *format = NULL;
+			unsigned int rate = a->sample_rate;
+
+			if (!b || a->asterisk_format != b->asterisk_format) {
+				continue;
+			}
+
+			if (a->asterisk_format) {
+				format = ast_format_joint(a->format, b->format);
+				if (!format) {
+					continue;
+				}
+			} else {
+				rate = rate ? rate : ast_rtp_lookup_sample_rate2(0, NULL, a->rtp_code);
+				if (a->rtp_code != b->rtp_code
+					|| rate != (b->sample_rate ? b->sample_rate
+						: ast_rtp_lookup_sample_rate2(0, NULL, b->rtp_code))) {
+					continue;
+				}
+			}
+
+			joint = rtp_payload_type_alloc(format, payload, a->rtp_code, 1, rate);
+			ao2_cleanup(format);
+			if (!joint) {
+				goto done;
+			}
+			AST_VECTOR_REPLACE(&common->payload_mapping_tx, payload, joint);
+			AST_VECTOR_REPLACE(&common->payload_mapping_rx, payload, ao2_bump(joint));
+
+			if (joint->asterisk_format && preferred->preferred_format
+				&& ast_format_cmp(joint->format, preferred->preferred_format) != AST_FORMAT_CMP_NOT_EQUAL) {
+				ao2_replace(common->preferred_format, joint->format);
+			} else if (!joint->asterisk_format && joint->rtp_code == AST_RTP_DTMF
+				&& payload == preferred->preferred_dtmf_pt) {
+				common->preferred_dtmf_pt = payload;
+				common->preferred_dtmf_rate = rate;
+			}
+			break;
+		}
+	}
+
+	res = !rtp_codecs_common_equal(*codecs, common);
+	if (res) {
+		ao2_cleanup(*codecs);
+		*codecs = ao2_bump(common);
+	}
+
+done:
+	if (other != preferred) {
+		ast_rwlock_unlock(&other->codecs_lock);
+	}
+	ast_rwlock_unlock(&preferred->codecs_lock);
+	ao2_ref(common, -1);
+	return res;
+}
+
 void ast_rtp_codecs_payloads_set_m_type(struct ast_rtp_codecs *codecs, struct ast_rtp_instance *instance, int payload)
 {
 	struct ast_rtp_payload_type *new_type;
@@ -1557,47 +1691,6 @@ int ast_rtp_codecs_payloads_set_rtpmap_type_rate(struct ast_rtp_codecs *codecs, 
 	return (found ? 0 : -2);
 }
 
-int ast_rtp_codecs_payload_set_fmtp(struct ast_rtp_codecs *codecs, int payload, const char *fmtp)
-{
-	struct ast_rtp_payload_type *current;
-	struct ast_rtp_payload_type *new_type;
-
-	if (payload < 0 || payload >= AST_RTP_MAX_PT || !fmtp) {
-		return -1;
-	}
-
-	ast_rwlock_wrlock(&codecs->codecs_lock);
-	if (payload >= AST_VECTOR_SIZE(&codecs->payload_mapping_tx)
-		|| !(current = AST_VECTOR_GET(&codecs->payload_mapping_tx, payload))) {
-		ast_rwlock_unlock(&codecs->codecs_lock);
-		return -1;
-	}
-
-	new_type = rtp_payload_type_clone(current);
-	if (!new_type) {
-		ast_rwlock_unlock(&codecs->codecs_lock);
-		return -1;
-	}
-
-	ast_free(new_type->fmtp);
-	new_type->fmtp = ast_strdup(fmtp);
-	if (!new_type->fmtp) {
-		ao2_ref(new_type, -1);
-		ast_rwlock_unlock(&codecs->codecs_lock);
-		return -1;
-	}
-
-	if (AST_VECTOR_REPLACE(&codecs->payload_mapping_tx, payload, new_type)) {
-		ao2_ref(new_type, -1);
-		ast_rwlock_unlock(&codecs->codecs_lock);
-		return -1;
-	}
-	ao2_ref(current, -1);
-	ast_rwlock_unlock(&codecs->codecs_lock);
-
-	return 0;
-}
-
 int ast_rtp_codecs_payloads_set_rtpmap_type(struct ast_rtp_codecs *codecs, struct ast_rtp_instance *instance, int payload, char *mimetype, char *mimesubtype, enum ast_rtp_options options)
 {
 	return ast_rtp_codecs_payloads_set_rtpmap_type_rate(codecs, instance, payload, mimetype, mimesubtype, options, 0);
@@ -1682,23 +1775,6 @@ struct ast_rtp_payload_type *ast_rtp_codecs_get_payload(struct ast_rtp_codecs *c
 		type = ao2_bump(static_RTP_PT[payload]);
 		ast_rwlock_unlock(&static_RTP_PT_lock);
 	}
-
-	return type;
-}
-
-struct ast_rtp_payload_type *ast_rtp_codecs_get_payload_tx(struct ast_rtp_codecs *codecs, int payload)
-{
-	struct ast_rtp_payload_type *type = NULL;
-
-	if (payload < 0 || payload >= AST_RTP_MAX_PT) {
-		return NULL;
-	}
-
-	ast_rwlock_rdlock(&codecs->codecs_lock);
-	if (payload < AST_VECTOR_SIZE(&codecs->payload_mapping_tx)) {
-		type = ao2_bump(AST_VECTOR_GET(&codecs->payload_mapping_tx, payload));
-	}
-	ast_rwlock_unlock(&codecs->codecs_lock);
 
 	return type;
 }
@@ -2216,19 +2292,6 @@ int ast_rtp_codecs_payload_set_rx_sample_rate(struct ast_rtp_codecs *codecs, int
 	return rtp_codecs_assign_payload_code_rx(codecs, 1, format, code, 0, sample_rate);
 }
 
-int ast_rtp_codecs_payload_set_rx_type(struct ast_rtp_codecs *codecs, struct ast_rtp_payload_type *type)
-{
-	if (!type || type->payload < 0 || type->payload >= AST_RTP_MAX_PT) {
-		return -1;
-	}
-
-	ast_rwlock_wrlock(&codecs->codecs_lock);
-	rtp_codecs_payload_replace_rx(codecs, type->payload, type);
-	ast_rwlock_unlock(&codecs->codecs_lock);
-
-	return 0;
-}
-
 int ast_rtp_codecs_payload_code_tx_sample_rate(struct ast_rtp_codecs *codecs, int asterisk_format, const struct ast_format *format, int code, unsigned int sample_rate)
 {
 	struct ast_rtp_payload_type *type;
@@ -2262,10 +2325,17 @@ int ast_rtp_codecs_payload_code_tx_sample_rate(struct ast_rtp_codecs *codecs, in
 				continue;
 			}
 
-			if (type->asterisk_format
-				&& ast_format_cmp(format, type->format) == AST_FORMAT_CMP_EQUAL) {
-				payload = idx;
-				break;
+			if (type->asterisk_format) {
+				enum ast_format_cmp_res cmp = ast_format_cmp(format, type->format);
+
+				if (cmp == AST_FORMAT_CMP_EQUAL) {
+					payload = idx;
+					break;
+				}
+				/* Bridged media may have compatible, but not identical, attributes. */
+				if (cmp == AST_FORMAT_CMP_SUBSET && payload < 0) {
+					payload = idx;
+				}
 			}
 		}
 		ast_rwlock_unlock(&codecs->codecs_lock);
