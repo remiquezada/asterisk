@@ -78,9 +78,17 @@ AST_TEST_DEFINE(opus_format_cmp)
 		RAII_VAR(struct ast_format *, changed, NULL, ao2_cleanup);
 		RAII_VAR(struct ast_format *, clone, NULL, ao2_cleanup);
 		RAII_VAR(struct ast_format *, joint, NULL, ao2_cleanup);
+		const char *value = attributes[i].value;
+
+		/* FEC's default is build-dependent, so always exercise a real change. */
+		if (!strcmp(attributes[i].name, "useinbandfec")) {
+			const int *fec = ast_format_attribute_get(defaults, attributes[i].name);
+
+			value = fec && *fec ? "0" : "1";
+		}
 
 		ast_test_status_update(test, "Comparing attribute %s\n", attributes[i].name);
-		changed = ast_format_attribute_set(defaults, attributes[i].name, attributes[i].value);
+		changed = ast_format_attribute_set(defaults, attributes[i].name, value);
 		ast_test_validate(test, changed != NULL);
 		ast_test_validate(test, ast_format_cmp(defaults, changed) == AST_FORMAT_CMP_SUBSET);
 		ast_test_validate(test, ast_format_cmp(changed, defaults) == AST_FORMAT_CMP_SUBSET);
